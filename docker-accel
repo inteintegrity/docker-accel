@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+#
+# docker-accel — configure and use container-registry acceleration on a device.
+#
+# Routes supported for pulling images from ghcr.io / docker.io:
+#   direct  — plain connection, always available
+#   proxy   — HTTP proxy in front of the Docker daemon (e.g. Clash on the LAN)
+#   mirror  — registry mirror such as ghcr.nju.edu.cn, used by `docker-accel pull`
+#
+# The script is idempotent, backs up every file it touches, and restores the
+# previous state with `docker-accel off`. Use --dry-run to preview any change.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="$(basename "$0")"
+
+SYSTEMD_DIR="/etc/systemd/system/docker.service.d"
+PROXY_CONF="${SYSTEMD_DIR}/http-proxy.conf"
+BACKUP_ROOT="/etc/docker-accel/backup"
+STATE_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/docker-accel"
+STATE_FILE="${STATE_DIR}/state"
+DAEMON_JSON="/etc/docker/daemon.json"
+
+# Defaults; override with flags, environment or the saved state.
+DEFAULT_MIRROR="${DOCKER_ACCEL_DEFAULT_MIRROR:-ghcr.nju.edu.cn}"
+DEFAULT_PROXY="${DOCKER_ACCEL_DEFAULT_PROXY:-}"
+NO_PROXY_LIST="localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+
+# A stable public artifact used to compare raw throughput between routes.
+PROBE_URL="${DOCKER_ACCEL_PROBE_URL:-https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.19.0/hailo8/arcface_mobilefacenet.hef}"
+PROBE_BYTES="${DOCKER_ACCEL_PROBE_BYTES:-4194304}"    # 4 MiB
+PROBE_TIMEOUT="${DOCKER_ACCEL_PROBE_TIMEOUT:-25}"     # seconds per request
+
+DRY_RUN=0
+ASSUME_YES=0
+
+# ----------------------------------------------------------------- utilities
+c_red=""; c_green=""; c_yellow=""; c_dim=""; c_reset=""
+if [ -t 1 ]; then
+  c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
+  c_dim=$'\033[2m'; c_reset=$'\033[0m'
+fi
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${c_dim}==>${c_reset} $*"; }
+ok()   { printf '%s\n' "${c_green}OK${c_reset}  $*"; }
+warn() { printf '%s\n' "${c_yellow}WARN${c_reset} $*" >&2; }
+die()  { printf '%s\n' "${c_red}ERR${c_reset} $*" >&2; exit 1; }
+
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
+
+need_root() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ "$(id -u)" -eq 0 ] || die "this command needs root: re-run with sudo"
+}
+
+require_linux() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ "$(uname -s)" = "Linux" ] || die "configuring the daemon requires Linux + systemd (use --dry-run to preview)"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  printf '%s [y/N] ' "$1"
+  read -r answer
+  case "$answer" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+backup_file() {
+  local path="$1"
+  [ -e "$path" ] || return 0
+  local dest="${BACKUP_ROOT}/$(timestamp)"
+  info "backing up ${path} -> ${dest}/"
+  run mkdir -p "$dest"
+  run cp -a "$path" "${dest}/$(basename "$path")"
+}
+
+# ----------------------------------------------------------------- state file
+MIRROR=""
+PROXY=""
+LAST_PROBE=""
+LAST_PULL=""
+
+load_state() {
+  [ -f "$STATE_FILE" ] || return 0
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+}
+
+save_state() {
+  run mkdir -p "$STATE_DIR"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] write %s (MIRROR=%s PROXY=%s)\n' "$STATE_FILE" "$MIRROR" "$PROXY"
+    return 0
+  fi
+  {
+    printf 'MIRROR=%q\n' "$MIRROR"
+    printf 'PROXY=%q\n' "$PROXY"
+    printf 'LAST_PROBE=%q\n' "$LAST_PROBE"
+    printf 'LAST_PULL=%q\n' "$LAST_PULL"
+  } > "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+}
+
+# -------------------------------------------------------------------- probing
+# Measure throughput (KB/s) of a fixed byte range through the given curl args.
+measure_speed() {
+  local label="$1"; shift
+  local out speed code
+  out="$(curl -sS -L --max-time "$PROBE_TIMEOUT" -o /dev/null \
+      -r "0-$((PROBE_BYTES - 1))" \
+      -w '%{speed_download} %{http_code} %{time_total}' "$@" "$PROBE_URL" 2>/dev/null || echo '0 000 0')"
+  speed="$(printf '%s' "$out" | awk '{print $1}')"
+  code="$(printf '%s' "$out" | awk '{print $2}')"
+  if [ "${code:-0}" != "200" ] && [ "${code:-0}" != "206" ]; then
+    printf '%-8s %10s %s\n' "$label" "unreachable" "(http ${code})"
+    return 1
+  fi
+  printf '%-8s %10.0f KB/s\n' "$label" "$(printf '%s' "$speed" | awk '{print $1/1024}')"
+  return 0
+}
+
+reachable() {  # url [curl args...]
+  local url="$1"; shift
+  local code
+  code="$(curl -sS -o /dev/null -m 12 -w '%{http_code}' "$@" "$url" 2>/dev/null || echo 000)"
+  [ "$code" != "000" ]
+}
+
+cmd_probe() {
+  local proxy="${1:-$PROXY}"
+  local mirror="${2:-$MIRROR}"
+
+  info "throughput probe (reference: ${PROBE_BYTES} bytes from ${PROBE_URL})"
+  local direct_result proxy_result
+  if measure_speed "direct"; then direct_result=1; else direct_result=0; fi
+  if [ -n "$proxy" ]; then
+    if measure_speed "proxy" -x "http://${proxy}"; then proxy_result=1; else proxy_result=0; fi
+  fi
+
+  echo
+  info "reachability"
+  if reachable "https://ghcr.io/v2/"; then ok "ghcr.io reachable (direct)"; else warn "ghcr.io not reachable (direct)"; fi
+  if [ -n "$proxy" ]; then
+    if reachable "https://ghcr.io/v2/" -x "http://${proxy}"; then ok "ghcr.io reachable via ${proxy}"; else warn "ghcr.io not reachable via ${proxy}"; fi
+    # Clash/mihomo style proxies answer on their own control port; a TCP probe
+    # here only proves the HTTP proxy accepts connections.
+  fi
+  if [ -n "$mirror" ]; then
+    if reachable "https://${mirror}/v2/"; then ok "mirror ${mirror} reachable"; else warn "mirror ${mirror} not reachable"; fi
+  fi
+
+  echo
+  if [ -n "$proxy" ] && [ "${proxy_result:-0}" -eq 1 ]; then
+    ok "recommended route: proxy (${proxy})"
+    LAST_PROBE="proxy ${proxy} $(date -Iseconds)"
+  elif [ -n "$mirror" ] && reachable "https://${mirror}/v2/"; then
+    ok "recommended route: mirror (${mirror})"
+    LAST_PROBE="mirror ${mirror} $(date -Iseconds)"
+  elif [ "$direct_result" -eq 1 ]; then
+    ok "recommended route: direct"
+    LAST_PROBE="direct - $(date -Iseconds)"
+  else
+    warn "no route reached the reference artifact; check connectivity"
+    LAST_PROBE="none - $(date -Iseconds)"
+  fi
+  save_state
+  echo
+  log "note: run 'docker-accel proxy <host:port>' to apply the proxy route, or"
+  log "      'docker-accel pull <image>' to pull through the recommended route."
+}
+
+# ---------------------------------------------------------------------- proxy
+proxy_conf_has_proxy() { [ -f "$PROXY_CONF" ] && grep -q 'HTTP_PROXY=' "$PROXY_CONF"; }
+
+cmd_proxy_set() {
+  local proxy="$1"
+  case "$proxy" in
+    *:*) : ;;
+    *) die "expected host:port, got '${proxy}'" ;;
+  esac
+  need_root
+  require_linux
+
+  if proxy_conf_has_proxy && [ "$DRY_RUN" -eq 0 ]; then
+    local current
+    current="$(grep -m1 'HTTP_PROXY=' "$PROXY_CONF" | sed 's/.*HTTP_PROXY="\?\([^"]*\)"\?.*/\1/')"
+    if [ "$current" = "http://${proxy}" ]; then
+      ok "proxy already configured: ${current}"
+      PROXY="$proxy"; save_state; return 0
+    fi
+  fi
+
+  backup_file "$PROXY_CONF"
+  run mkdir -p "$SYSTEMD_DIR"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] write %s with HTTP_PROXY/HTTPS_PROXY=http://%s and NO_PROXY=%s\n' \
+      "$PROXY_CONF" "$proxy" "$NO_PROXY_LIST"
+  else
+    cat > "$PROXY_CONF" <<EOF
+[Service]
+Environment="HTTP_PROXY=http://${proxy}"
+Environment="HTTPS_PROXY=http://${proxy}"
+Environment="NO_PROXY=${NO_PROXY_LIST}"
+EOF
+    ok "wrote ${PROXY_CONF}"
+  fi
+
+  info "restarting docker"
+  run systemctl daemon-reload
+  if ! run systemctl restart docker; then
+    warn "docker restart failed; restoring the previous configuration"
+    restore_latest_backup "$PROXY_CONF"
+    run systemctl daemon-reload
+    run systemctl restart docker || true
+    die "proxy not applied"
+  fi
+  if [ "$DRY_RUN" -eq 0 ] && ! docker info >/dev/null 2>&1; then
+    warn "'docker info' failed after restart; restoring the previous configuration"
+    restore_latest_backup "$PROXY_CONF"
+    systemctl daemon-reload
+    systemctl restart docker || true
+    die "proxy not applied"
+  fi
+  ok "docker daemon now uses http://${proxy}"
+  PROXY="$proxy"
+  save_state
+  log "verify with: docker-accel pull ghcr.io/seeed-projects/recomputer-hailo10h-cv/yolov8_pose:latest"
+}
+
+cmd_proxy_off() {
+  need_root
+  require_linux
+  if [ ! -e "$PROXY_CONF" ]; then
+    ok "no proxy configuration present"
+    PROXY=""; save_state; return 0
+  fi
+  backup_file "$PROXY_CONF"
+  run rm -f "$PROXY_CONF"
+  run systemctl daemon-reload
+  run systemctl restart docker
+  ok "proxy configuration removed"
+  PROXY=""
+  save_state
+}
+
+cmd_proxy_status() {
+  if [ -f "$PROXY_CONF" ]; then
+    log "docker daemon proxy (${PROXY_CONF}):"
+    sed 's/^/  /' "$PROXY_CONF"
+  else
+    log "docker daemon proxy: not configured"
+  fi
+  if [ -f "$DAEMON_JSON" ]; then
+    log "docker daemon.json registry-mirrors:"
+    grep -o '"registry-mirrors"[^]]*]' "$DAEMON_JSON" 2>/dev/null | sed 's/^/  /' || log "  (none)"
+  fi
+}
+
+# --------------------------------------------------------------------- mirror
+cmd_mirror_set() {
+  local mirror="$1"
+  case "$mirror" in
+    */*|*:*) die "expected a hostname such as ghcr.nju.edu.cn, got '${mirror}'" ;;
+  esac
+  if reachable "https://${mirror}/v2/"; then
+    ok "mirror ${mirror} reachable"
+  else
+    warn "mirror ${mirror} did not answer on /v2/; pulls may fail"
+  fi
+  MIRROR="$mirror"
+  save_state
+  ok "mirror route set to ${mirror}"
+  log "pulls go through: docker-accel pull ghcr.io/<owner>/<image>:<tag>"
+}
+
+cmd_mirror_off() {
+  MIRROR=""
+  save_state
+  ok "mirror route cleared"
+}
+
+# ----------------------------------------------------------------------- pull
+rewrite_to_mirror() {  # image mirror
+  local image="$1" mirror="$2"
+  case "$image" in
+    ghcr.io/*) printf '%s/%s' "$mirror" "${image#ghcr.io/}" ;;
+    *) printf '%s' "$image" ;;
+  esac
+}
+
+choose_route() {
+  # Explicit -r wins, else the last probe result, else direct.
+  echo "${ROUTE:-}"
+}
+
+cmd_pull() {
+  local image="$1"
+  [ -n "$image" ] || die "usage: ${PROG} pull <image>"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] docker pull %s (route: %s)
+' "$image" "${ROUTE_OVERRIDE:-${LAST_PROBE%% *}}"
+    return 0
+  fi
+  have docker || die "docker is not installed"
+
+  local route
+  route="${ROUTE_OVERRIDE:-}"
+  if [ -z "$route" ]; then
+    route="$(printf '%s' "${LAST_PROBE:-}" | awk '{print $1}')"
+  fi
+  [ -n "$route" ] || route="direct"
+
+  local ref="$image"
+  case "$route" in
+    mirror)
+      [ -n "$MIRROR" ] || die "mirror route selected but no mirror configured: ${PROG} mirror <host>"
+      ref="$(rewrite_to_mirror "$image" "$MIRROR")"
+      ;;
+    proxy)
+      [ -n "$PROXY" ] || die "proxy route selected but no proxy configured: ${PROG} proxy <host:port>"
+      ;;
+    direct) : ;;
+    *) warn "unknown route '${route}', falling back to direct"; route="direct" ;;
+  esac
+
+  info "route=${route}"
+  [ "$ref" != "$image" ] && log "  pulling ${ref}"
+  [ "$ref" != "$image" ] || log "  pulling ${image}"
+
+  local start end seconds
+  start="$(date +%s)"
+  if ! docker pull "$ref"; then
+    warn "pull failed on route=${route}"
+    if [ "$ref" != "$image" ]; then
+      warn "retrying without the mirror"
+      docker pull "$image" || die "pull failed on every route"
+      ref="$image"
+    else
+      die "pull failed"
+    fi
+  fi
+  end="$(date +%s)"
+  seconds=$((end - start))
+
+  if [ "$ref" != "$image" ]; then
+    run docker tag "$ref" "$image"
+    ok "tagged ${ref} -> ${image}"
+  fi
+
+  local size bytes
+  size="$(docker image inspect "$image" --format '{{.Size}}' 2>/dev/null || echo 0)"
+  bytes="${size:-0}"
+  if [ "$seconds" -gt 0 ] && [ "$bytes" -gt 0 ]; then
+    printf '%s\n' "  ${seconds}s for $((bytes / 1048576)) MiB  (~$((bytes / 1024 / seconds)) KB/s)"
+    LAST_PULL="${route} ${image} ${seconds}s $((bytes / 1024 / seconds))KB/s $(date -Iseconds)"
+  else
+    LAST_PULL="${route} ${image} ${seconds}s - $(date -Iseconds)"
+  fi
+  save_state
+  ok "done: ${image}"
+}
+
+# --------------------------------------------------------------------- status
+cmd_status() {
+  log "docker-accel ${VERSION}"
+  if have docker; then
+    log "docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'not reachable')"
+  else
+    log "docker: not installed"
+  fi
+  cmd_proxy_status
+  log "routes:"
+  log "  mirror: ${MIRROR:-(not set; default suggestion ${DEFAULT_MIRROR})}"
+  log "  proxy:  ${PROXY:-(not set; default suggestion ${DEFAULT_PROXY:-none})}"
+  log "last probe: ${LAST_PROBE:-never}"
+  log "last pull:  ${LAST_PULL:-never}"
+  if [ -f "$STATE_FILE" ]; then
+    log "state file: ${STATE_FILE}"
+  fi
+}
+
+# ------------------------------------------------------------------ restoring
+restore_latest_backup() {
+  local path="$1"
+  local latest
+  latest="$(ls -1d "${BACKUP_ROOT}"/*/ 2>/dev/null | sort | tail -n1 || true)"
+  [ -n "$latest" ] || return 1
+  local candidate="${latest}$(basename "$path")"
+  [ -e "$candidate" ] || return 1
+  run cp -a "$candidate" "$path"
+  ok "restored ${path} from ${candidate}"
+}
+
+cmd_off() {
+  need_root
+  require_linux
+  info "restoring the previous docker configuration"
+  if [ -e "$PROXY_CONF" ]; then
+    backup_file "$PROXY_CONF"
+    restore_latest_backup "$PROXY_CONF" || run rm -f "$PROXY_CONF"
+  fi
+  run systemctl daemon-reload
+  run systemctl restart docker || true
+  MIRROR=""; PROXY=""
+  save_state
+  ok "docker-accel configuration removed; backups kept in ${BACKUP_ROOT}"
+}
+
+# ----------------------------------------------------------------------- help
+usage() {
+  cat <<EOF
+${PROG} ${VERSION} — container registry acceleration for devices
+
+usage:
+  ${PROG} probe [host:port] [mirror-host]   measure direct / proxy / mirror routes
+  ${PROG} proxy <host:port>                 route the Docker daemon through an HTTP proxy
+  ${PROG} proxy off                         remove the daemon proxy
+  ${PROG} proxy status                      show the current proxy / registry-mirror config
+  ${PROG} mirror <host>                     set the registry mirror used by 'pull'
+  ${PROG} mirror off                        clear the mirror
+  ${PROG} pull [-R direct|proxy|mirror] <image>
+                                            pull an image through the chosen route and
+                                            retag it back to the original name
+  ${PROG} status                            show routes, last probe and last pull
+  ${PROG} off                               restore the previous docker configuration
+
+options:
+  -n, --dry-run      print the planned actions without changing anything
+  -y, --yes          do not ask for confirmation
+  -h, --help         show this help
+  -V, --version      show the version
+
+examples:
+  sudo ${PROG} proxy 192.168.3.114:6789
+  ${PROG} probe 192.168.3.114:6789
+  ${PROG} pull ghcr.io/seeed-projects/recomputer-hailo10h-cv/yolov8_pose:latest
+  sudo ${PROG} off
+EOF
+}
+
+# ----------------------------------------------------------------------- main
+main() {
+  local cmd="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes)     ASSUME_YES=1 ;;
+      -R|--route)   shift; ROUTE_OVERRIDE="${1:-}" ;;
+      -h|--help)    usage; return 0 ;;
+      -V|--version) printf '%s
+' "$VERSION"; return 0 ;;
+      -*)           die "unknown option: $1 (see --help)" ;;
+      *)
+        if [ -z "$cmd" ]; then cmd="$1"; else args+=("$1"); fi
+        ;;
+    esac
+    shift || true
+  done
+  [ -n "$cmd" ] || cmd="help"
+
+  load_state
+  [ -n "${MIRROR:-}" ] || MIRROR="$DEFAULT_MIRROR"
+
+  local a1="${args[0]:-}"
+  local a2="${args[1]:-}"
+  case "$cmd" in
+    probe)  cmd_probe "${a1:-${PROXY:-$DEFAULT_PROXY}}" "${a2:-$MIRROR}" ;;
+    proxy)
+      case "${a1:-status}" in
+        off) cmd_proxy_off ;;
+        status|"") cmd_proxy_status ;;
+        *) cmd_proxy_set "$a1" ;;
+      esac
+      ;;
+    mirror)
+      case "$a1" in
+        off) cmd_mirror_off ;;
+        "")  log "current mirror: ${MIRROR}"; log "usage: ${PROG} mirror <host>" ;;
+        *)   cmd_mirror_set "$a1" ;;
+      esac
+      ;;
+    pull)   cmd_pull "$a1" ;;
+    status) cmd_status ;;
+    off)    cmd_off ;;
+    help)   usage ;;
+    *) usage; die "unknown command: ${cmd}" ;;
+  esac
+}
+
+main "$@"
