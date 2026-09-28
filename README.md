@@ -29,7 +29,7 @@ ssh <user>@<board> 'sudo install -m 0755 /tmp/docker-accel /usr/local/bin/docker
 Or from a clone:
 
 ```bash
-git clone https://github.com/Seeed-Projects/docker-accel.git
+git clone https://github.com/inteintegrity/docker-accel.git
 sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
 ```
 

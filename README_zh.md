@@ -27,7 +27,7 @@ ssh <user>@<开发板> 'sudo install -m 0755 /tmp/docker-accel /usr/local/bin/do
 或者从仓库安装：
 
 ```bash
-git clone https://github.com/Seeed-Projects/docker-accel.git
+git clone https://github.com/inteintegrity/docker-accel.git
 sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
 ```
 
