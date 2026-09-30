@@ -33,6 +33,38 @@ sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
 
 只依赖 `bash` 和 `curl`（Raspberry Pi OS 自带）。
 
+## 一劳永逸：让 `docker run ghcr.io/...` 原样可用（推荐）
+
+如果设备上直连 `ghcr.io` 不稳（典型症状是 TLS 握手超时，或从
+`pkg-containers.githubusercontent.com` 拉层时 EOF），又不想每次都手写镜像站
+命令，可以装一个透明的 `docker` 包装器：它只拦截 `pull` / `run` / `create`，
+发现 ghcr.io / docker.io 的镜像本地没有时，**先经镜像站拉取并 retag**，然后
+原样交给真正的 `docker`。已经拉过的镜像完全不受影响，其他命令直接透传。
+
+```bash
+# 1) 装工具 + 包装器（sudo 的 secure_path 会优先命中 /usr/local/bin）
+git clone https://github.com/inteintegrity/docker-accel.git
+sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
+sudo install -m 0755 docker-accel/wrapper/docker  /usr/local/bin/docker
+
+# 2) 设定默认镜像站（ghcr 与 docker hub 可分别设置）
+sudo docker-accel mirror ghcr.nju.edu.cn
+
+# 3) 验证：随便跑一条 wiki 里的命令，应看到包装器提示经镜像站拉取
+sudo docker pull ghcr.io/seeed-projects/recomputer-hailo10h-cv/yolov8_pose:latest
+```
+
+可用环境变量微调（写进 `/etc/environment` 或包装器里）：
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `DOCKER_ACCEL_MIRROR` | `ghcr.nju.edu.cn` | ghcr.io 的镜像站 |
+| `DOCKER_ACCEL_HUB_MIRROR` | `docker.nju.edu.cn` | docker.io 的镜像站 |
+| `DOCKER_ACCEL_BIN` | `/usr/local/bin/docker-accel` | 加速脚本路径 |
+| `DOCKER_REAL_BIN` | 自动探测 | 真正的 docker 二进制 |
+
+不想要了就 `sudo rm /usr/local/bin/docker`，一条命令回到原状。
+
 ## 用法
 
 ```bash

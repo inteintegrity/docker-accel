@@ -35,6 +35,40 @@ sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
 
 Requires `bash` and `curl` only (both ship with Raspberry Pi OS).
 
+## Make `docker run ghcr.io/...` work as-is (recommended)
+
+When direct pulls from `ghcr.io` are unreliable (TLS handshake timeouts, or EOF
+while fetching layers from `pkg-containers.githubusercontent.com`), install the
+transparent `docker` wrapper instead of rewriting every command by hand. It only
+inspects `pull` / `run` / `create`; when a ghcr.io or docker.io image is not
+available locally it **fetches it through the mirror first, retags it**, and then
+hands the original command to the real `docker`. Local images are untouched and
+every other command is passed straight through.
+
+```bash
+# 1) tool + wrapper (sudo's secure_path prefers /usr/local/bin)
+git clone https://github.com/inteintegrity/docker-accel.git
+sudo install -m 0755 docker-accel/docker-accel /usr/local/bin/docker-accel
+sudo install -m 0755 docker-accel/wrapper/docker  /usr/local/bin/docker
+
+# 2) set the default mirrors
+sudo docker-accel mirror ghcr.nju.edu.cn
+
+# 3) verify: run any command from the wiki and watch the wrapper log
+sudo docker pull ghcr.io/seeed-projects/recomputer-hailo10h-cv/yolov8_pose:latest
+```
+
+Environment overrides:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOCKER_ACCEL_MIRROR` | `ghcr.nju.edu.cn` | mirror for ghcr.io |
+| `DOCKER_ACCEL_HUB_MIRROR` | `docker.nju.edu.cn` | mirror for docker.io |
+| `DOCKER_ACCEL_BIN` | `/usr/local/bin/docker-accel` | accelerator script |
+| `DOCKER_REAL_BIN` | auto-detected | the real docker binary |
+
+Remove it with `sudo rm /usr/local/bin/docker` and everything is back to stock.
+
 ## Use
 
 ```bash

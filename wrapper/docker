@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# docker — mirror-aware wrapper so the documented `docker pull` / `docker run`
+# commands keep working when ghcr.io (and its blob host
+# pkg-containers.githubusercontent.com) is unreachable or times out.
+#
+# Install as /usr/local/bin/docker (sudo's secure_path prefers it over
+# /usr/bin/docker, so `sudo docker ...` is covered too):
+#
+#   sudo install -m 0755 docker /usr/local/bin/docker
+#   sudo docker-accel mirror ghcr.nju.edu.cn      # optional: pre-set the mirror
+#
+# Behaviour:
+#   * only `pull`, `run` and `create` are inspected; every other command is
+#     passed through to the real docker unchanged;
+#   * if the referenced ghcr.io / docker.io image is already local, nothing
+#     happens;
+#   * otherwise the image is fetched through the mirror (docker-accel when
+#     present, otherwise a plain mirror pull + tag) and then the original
+#     command runs;
+#   * a failed mirror pull falls back to the real docker so a working direct
+#     connection is never blocked by this wrapper.
+#
+# Disable it with: sudo rm /usr/local/bin/docker
+#
+set -euo pipefail
+
+WRAPPER_PATH="${BASH_SOURCE[0]}"
+GHCR_MIRROR="${DOCKER_ACCEL_MIRROR:-ghcr.nju.edu.cn}"
+HUB_MIRROR="${DOCKER_ACCEL_HUB_MIRROR:-docker.nju.edu.cn}"
+ACCEL="${DOCKER_ACCEL_BIN:-/usr/local/bin/docker-accel}"
+
+find_real_docker() {
+  if [ "${DOCKER_REAL_BIN:-}" != "" ] && [ -x "${DOCKER_REAL_BIN}" ]; then
+    echo "${DOCKER_REAL_BIN}"
+    return 0
+  fi
+  local candidate
+  for candidate in /usr/bin/docker /bin/docker /usr/local/bin/docker.real; do
+    if [ -x "$candidate" ] && [ "$candidate" != "$WRAPPER_PATH" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  # last resort: first `docker` on PATH that is not this wrapper
+  local IFS=:
+  for dir in $PATH; do
+    candidate="$dir/docker"
+    if [ -x "$candidate" ] && [ "$candidate" != "$WRAPPER_PATH" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# first argument that looks like a registry reference (skip flags and their values)
+registry_ref_from_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      ghcr.io/*|docker.io/*) printf '%s' "$arg"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# ghcr.io/<path> -> <mirror>/<path>; docker.io/<path> -> <hub-mirror>/<path>
+mirror_ref() {
+  local ref="$1" host path
+  host="${ref%%/*}"
+  path="${ref#*/}"
+  case "$host" in
+    ghcr.io) printf '%s/%s' "$GHCR_MIRROR" "$path" ;;
+    docker.io) printf '%s/%s' "$HUB_MIRROR" "$path" ;;
+    *) printf '%s' "$ref" ;;
+  esac
+}
+
+main() {
+  local real
+  if ! real="$(find_real_docker)"; then
+    echo "docker wrapper: real docker binary not found" >&2
+    exit 127
+  fi
+
+  local cmd="${1:-}"
+  case "$cmd" in
+    pull|run|create) ;;
+    *) exec "$real" "$@" ;;
+  esac
+
+  local ref=""
+  if [ "$cmd" = "pull" ] || [ "$cmd" = "create" ]; then
+    ref="$(registry_ref_from_args "${2:-}" || true)"
+  else
+    ref="$(registry_ref_from_args "${@:2}" || true)"
+  fi
+
+  # nothing to do when the reference is not a mirrorable registry or is local
+  if [ -z "$ref" ] || "$real" image inspect "$ref" >/dev/null 2>&1; then
+    exec "$real" "$@"
+  fi
+
+  local mirror=""
+  mirror="$(mirror_ref "$ref")"
+  echo "[docker-wrapper] '$ref' is not local; fetching $mirror" >&2
+  if [ -x "$ACCEL" ]; then
+    "$ACCEL" pull "$ref" || echo "[docker-wrapper] mirror route failed; trying direct" >&2
+  else
+    "$real" pull "$mirror" && "$real" tag "$mirror" "$ref"
+  fi
+
+  exec "$real" "$@"
+}
+
+main "$@"
