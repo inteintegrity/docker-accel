@@ -133,7 +133,9 @@ sudo setup-device-proxy --proxy http://192.168.3.114:6789
 | 4 | Docker 守护进程 | `/etc/docker/daemon.json`（合并 proxies，保留其他键） |
 | 5 | 仅 overlayroot 板子 | containerd `root` 与 Docker `data-root` 挪到 `/media/root-rw/docker-data`（`containerd/`、`docker/`） |
 
-参数：`--proxy URL`、`--data-root DIR`、`--no-restart`、`--force`、`--dry-run`。
+参数：`--proxy URL`、`--data-root DIR`、`--no-restart`、`--force`、`--dry-run`，
+以及 `--with-rustdesk`（经代理下载并安装当前架构的 RustDesk `.deb`；
+`--rustdesk-version` / `--rustdesk-url` 可指定版本或下载地址）。
 所有被修改的文件都备份到 `/var/backups/setup-device-proxy/<时间戳>/`。
 新开的 SSH/终端会话自动带代理；当前 shell 需要手动
 `export http_proxy=... https_proxy=...`。

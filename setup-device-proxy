@@ -21,6 +21,7 @@
 # Usage:
 #   sudo ./setup-device-proxy --proxy http://192.168.3.114:6789
 #   sudo ./setup-device-proxy --proxy 192.168.3.114:6789 --dry-run
+#   sudo ./setup-device-proxy --proxy 192.168.3.114:6789 --with-rustdesk
 #
 # Default proxy: http://192.168.3.114:6789  (Clash on the LAN, allow-lan on)
 #
@@ -49,6 +50,9 @@ DRY_RUN=0
 NO_RESTART=0
 FORCE=0
 ASSUME_YES=0
+WITH_RUSTDESK=0
+RUSTDESK_VERSION="${SETUP_DEVICE_RUSTDESK_VERSION:-latest}"
+RUSTDESK_URL="${SETUP_DEVICE_RUSTDESK_URL:-}"
 BACKUP_DIR=""
 
 # ----------------------------------------------------------------- utilities
@@ -79,6 +83,10 @@ Options:
                      (default: $REAL_FS_HINT/docker-data)
   --no-restart       Write the configuration but do not restart services
   --force            Configure even if the proxy does not answer right now
+  --with-rustdesk    Also install RustDesk (the .deb for this architecture,
+                     downloaded through the proxy; needs a desktop session)
+  --rustdesk-version V   RustDesk version to install (default: latest)
+  --rustdesk-url URL     Download the .deb from this URL instead
   -y, --yes          Do not ask for confirmation
   -n, --dry-run      Print the plan, change nothing
   -h, --help         Show this help
@@ -109,6 +117,11 @@ while [ $# -gt 0 ]; do
     --data-root=*) DATA_ROOT_OVERRIDE="${1#*=}"; shift ;;
     --no-restart)  NO_RESTART=1; shift ;;
     --force)       FORCE=1; shift ;;
+    --with-rustdesk)      WITH_RUSTDESK=1; shift ;;
+    --rustdesk-version)   [ $# -ge 2 ] || die "--rustdesk-version needs a value"; RUSTDESK_VERSION="$2"; shift 2 ;;
+    --rustdesk-version=*) RUSTDESK_VERSION="${1#*=}"; shift ;;
+    --rustdesk-url)       [ $# -ge 2 ] || die "--rustdesk-url needs a value"; RUSTDESK_URL="$2"; shift 2 ;;
+    --rustdesk-url=*)     RUSTDESK_URL="${1#*=}"; shift ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
     -n|--dry-run)  DRY_RUN=1; shift ;;
     -h|--help)     usage; exit 0 ;;
@@ -405,6 +418,83 @@ step_restart() {
   fi
 }
 
+# ------------------------------------------------------------------ rustdesk
+rustdesk_arch() {
+  case "$(dpkg --print-architecture 2>/dev/null || echo arm64)" in
+    arm64) printf 'aarch64' ;;
+    amd64) printf 'x86_64' ;;
+    armhf) printf 'armv7-sciter' ;;
+    *)     return 1 ;;
+  esac
+}
+
+resolve_rustdesk_version() {
+  if [ "$RUSTDESK_VERSION" != "latest" ]; then
+    printf '%s' "$RUSTDESK_VERSION"
+    return 0
+  fi
+  local api tag=""
+  api="https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+  if have curl; then
+    tag="$(curl -x "$PROXY_URL" -fsSL -m 20 "$api" 2>/dev/null \
+           | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+           | head -n1 | sed -E 's/.*"([^"]+)"[[:space:]]*$/\1/')"
+  fi
+  [ -n "$tag" ] || return 1
+  printf '%s' "$tag"
+}
+
+step_rustdesk() {
+  [ "$WITH_RUSTDESK" -eq 1 ] || return 0
+
+  if dpkg -s rustdesk >/dev/null 2>&1; then
+    local current
+    current="$(dpkg-query -W -f='${Version}' rustdesk 2>/dev/null || echo unknown)"
+    if [ "$FORCE" -eq 0 ]; then
+      ok "rustdesk is already installed ($current); use --force to reinstall"
+      return 0
+    fi
+  fi
+
+  local arch version url
+  if ! arch="$(rustdesk_arch)"; then
+    warn "unsupported architecture ($(dpkg --print-architecture 2>/dev/null)); skipping rustdesk"
+    return 0
+  fi
+
+  if [ -n "$RUSTDESK_URL" ]; then
+    url="$RUSTDESK_URL"
+    version="custom"
+  else
+    if ! version="$(resolve_rustdesk_version)"; then
+      die "could not resolve the latest rustdesk version — pass --rustdesk-version or --rustdesk-url"
+    fi
+    url="https://github.com/rustdesk/rustdesk/releases/download/${version}/rustdesk-${version}-${arch}.deb"
+  fi
+
+  info "rustdesk $version ($arch)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would download %s\n' "$url"
+    printf '  [dry-run] would install it with: apt-get install -y <deb>\n'
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp --suffix=.deb)"
+  info "downloading rustdesk through the proxy"
+  if ! curl -x "$PROXY_URL" -fL --retry 3 --retry-delay 2 -m 600 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    die "failed to download $url"
+  fi
+  info "installing $(basename "$url") ($(du -h "$tmp" | cut -f1))"
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp"; then
+    rm -f "$tmp"
+    die "rustdesk installation failed (see the output above)"
+  fi
+  rm -f "$tmp"
+  ok "rustdesk installed: $(dpkg-query -W -f='${Version}' rustdesk 2>/dev/null || echo unknown)"
+}
+
 # --------------------------------------------------------------------- verify
 verify() {
   info "verification"
@@ -450,6 +540,7 @@ step_environment
 step_containerd_proxy
 step_docker
 step_restart
+step_rustdesk
 verify
 
 log ""
@@ -469,3 +560,6 @@ log "Notes:"
 log "  * apt and the shell use the proxy; ghcr.nju.edu.cn is always contacted directly."
 log "  * If you later run docker-accel's proxy route as well, it only covers"
 log "    dockerd — the containerd drop-in written here is what makes pulls work."
+if [ "$WITH_RUSTDESK" -eq 1 ]; then
+  log "  * rustdesk needs a desktop session (X11/Wayland) to serve a screen."
+fi

@@ -145,7 +145,9 @@ sudo setup-device-proxy --proxy http://192.168.3.114:6789
 | 5 | overlayroot boards only | containerd `root` and Docker `data-root` moved to `/media/root-rw/docker-data` (`containerd/`, `docker/`) |
 
 Flags: `--proxy URL`, `--data-root DIR`, `--no-restart`, `--force`,
-`--dry-run`. Every touched file is backed up under
+`--dry-run`, and `--with-rustdesk` (installs the RustDesk `.deb` for the
+current architecture through the proxy; `--rustdesk-version` / `--rustdesk-url`
+override what gets downloaded). Every touched file is backed up under
 `/var/backups/setup-device-proxy/<timestamp>/`. New SSH/terminal sessions pick
 up the proxy automatically; for the current shell export `http_proxy` /
 `https_proxy` manually.
