@@ -119,6 +119,40 @@ The proxy route needs the host side to accept LAN connections:
 3. Confirm the host IP did not change: `docker-accel probe <host>:6789` should
    report the proxy route as reachable.
 
+## Fresh board? One-shot proxy bootstrap
+
+`docker-accel` configures the Docker daemon only. A freshly flashed board also
+needs apt, the shell environment and — on Docker 28+/29 — **containerd**, because
+image pulls are performed by containerd, not by dockerd. On overlayroot boards
+(Armbian) container storage must also move off the overlay filesystem, otherwise
+layer extraction fails with
+`failed to convert whiteout file ...: operation not permitted`.
+
+`setup-device-proxy` covers all of that in one idempotent pass:
+
+```bash
+git clone https://github.com/inteintegrity/docker-accel.git
+sudo install -m 0755 docker-accel/setup-device-proxy /usr/local/bin/setup-device-proxy
+sudo setup-device-proxy --proxy http://192.168.3.114:6789
+```
+
+| # | Target | File it writes |
+| - | --- | --- |
+| 1 | apt | `/etc/apt/apt.conf.d/99proxy.conf` |
+| 2 | shell / wget / git (new sessions) | `/etc/environment` (managed block) |
+| 3 | containerd — the process that actually pulls images | `/etc/systemd/system/containerd.service.d/http-proxy.conf` |
+| 4 | Docker daemon | `/etc/docker/daemon.json` (proxies merged, other keys kept) |
+| 5 | overlayroot boards only | containerd `root` and Docker `data-root` moved to `/media/root-rw/docker-data` |
+
+Flags: `--proxy URL`, `--data-root DIR`, `--no-restart`, `--force`,
+`--dry-run`. Every touched file is backed up under
+`/var/backups/setup-device-proxy/<timestamp>/`. New SSH/terminal sessions pick
+up the proxy automatically; for the current shell export `http_proxy` /
+`https_proxy` manually.
+
+`ghcr.nju.edu.cn` is added to `no_proxy`, so mirror pulls always take the direct
+route while everything else goes through the proxy.
+
 ## Notes
 
 - `registry-mirrors` in `/etc/docker/daemon.json` only affects Docker Hub

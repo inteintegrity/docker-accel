@@ -110,6 +110,36 @@ docker-accel -n proxy ...  # --dry-run：只打印将要执行的动作
    `New-NetFirewallRule -DisplayName "Allow LAN proxy 6789" -Direction Inbound -Protocol TCP -LocalPort 6789 -Action Allow -Profile Any`。
 3. 确认主机 IP 没变：`docker-accel probe <主机IP>:6789` 应报告代理路径可达。
 
+## 刚刷好系统？一键代理初始化
+
+`docker-accel` 只配置 Docker 守护进程。刚刷好的板子还需要 apt、shell 环境，以及
+Docker 28+/29 下的 **containerd**——真正下载镜像的是 containerd 而不是 dockerd。
+另外 overlayroot 的板子（Armbian）必须把容器存储挪出 overlay 文件系统，否则解压
+镜像层会报 `failed to convert whiteout file ...: operation not permitted`。
+
+`setup-device-proxy` 一次把这几件事都配好（可重复执行、自动备份）：
+
+```bash
+git clone https://github.com/inteintegrity/docker-accel.git
+sudo install -m 0755 docker-accel/setup-device-proxy /usr/local/bin/setup-device-proxy
+sudo setup-device-proxy --proxy http://192.168.3.114:6789
+```
+
+| # | 配置对象 | 写入的文件 |
+| - | --- | --- |
+| 1 | apt | `/etc/apt/apt.conf.d/99proxy.conf` |
+| 2 | shell / wget / git（新会话生效） | `/etc/environment`（带标记的托管块） |
+| 3 | containerd（真正拉镜像的进程） | `/etc/systemd/system/containerd.service.d/http-proxy.conf` |
+| 4 | Docker 守护进程 | `/etc/docker/daemon.json`（合并 proxies，保留其他键） |
+| 5 | 仅 overlayroot 板子 | containerd `root` 与 Docker `data-root` 挪到 `/media/root-rw/docker-data` |
+
+参数：`--proxy URL`、`--data-root DIR`、`--no-restart`、`--force`、`--dry-run`。
+所有被修改的文件都备份到 `/var/backups/setup-device-proxy/<时间戳>/`。
+新开的 SSH/终端会话自动带代理；当前 shell 需要手动
+`export http_proxy=... https_proxy=...`。
+
+`ghcr.nju.edu.cn` 会写入 `no_proxy`，镜像站始终直连，其余流量走代理。
+
 ## 说明
 
 - `/etc/docker/daemon.json` 里的 `registry-mirrors` **只对 Docker Hub（`docker.io`）生效**，

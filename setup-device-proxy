@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+#
+# setup-device-proxy — one-shot proxy bootstrap for a freshly flashed board.
+#
+# After re-flashing, a board typically has none of the configuration that makes
+# `apt install` and `docker pull` usable on a CN network:
+#
+#   1. apt has no proxy        -> `apt update` / `apt install` time out
+#   2. the shell has no proxy  -> wget/curl/git to GitHub hang
+#   3. containerd has no proxy -> `docker pull ghcr.io/...` dies with
+#      "httpReadSeeker: failed open: ... EOF". Docker 28+/29 fetch images
+#      through containerd, so configuring only docker.service is not enough.
+#   4. overlayroot boards (Armbian) keep container data on an overlay
+#      filesystem -> layer extraction fails with
+#      "failed to convert whiteout file ...: operation not permitted".
+#
+# This script configures all four in one idempotent pass, backs up every file
+# it touches (under /var/backups/setup-device-proxy/<timestamp>/) and verifies
+# the result at the end.
+#
+# Usage:
+#   sudo ./setup-device-proxy --proxy http://192.168.3.114:6789
+#   sudo ./setup-device-proxy --proxy 192.168.3.114:6789 --dry-run
+#
+# Default proxy: http://192.168.3.114:6789  (Clash on the LAN, allow-lan on)
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="$(basename "$0")"
+
+APT_CONF="/etc/apt/apt.conf.d/99proxy.conf"
+ENV_FILE="/etc/environment"
+ENV_MARK_BEGIN="# >>> setup-device-proxy >>>"
+ENV_MARK_END="# <<< setup-device-proxy <<<"
+CONTAINERD_DROPIN_DIR="/etc/systemd/system/containerd.service.d"
+CONTAINERD_DROPIN="${CONTAINERD_DROPIN_DIR}/http-proxy.conf"
+CONTAINERD_CONFIG="/etc/containerd/config.toml"
+DAEMON_JSON="/etc/docker/daemon.json"
+BACKUP_ROOT="/var/backups/setup-device-proxy"
+
+DEFAULT_PROXY="http://192.168.3.114:6789"
+NO_PROXY_LIST="localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,ghcr.nju.edu.cn"
+REAL_FS_HINT="/media/root-rw"   # Armbian overlayroot persistent userdata
+
+PROXY_URL="${SETUP_DEVICE_PROXY_URL:-$DEFAULT_PROXY}"
+DATA_ROOT_OVERRIDE=""
+DRY_RUN=0
+NO_RESTART=0
+FORCE=0
+ASSUME_YES=0
+BACKUP_DIR=""
+
+# ----------------------------------------------------------------- utilities
+c_red=""; c_green=""; c_yellow=""; c_dim=""; c_reset=""
+if [ -t 1 ]; then
+  c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
+  c_dim=$'\033[2m'; c_reset=$'\033[0m'
+fi
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${c_dim}==>${c_reset} $*"; }
+ok()   { printf '%s\n' "${c_green}OK${c_reset}  $*"; }
+warn() { printf '%s\n' "${c_yellow}WARN${c_reset} $*" >&2; }
+die()  { printf '%s\n' "${c_red}ERR${c_reset} $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — one-shot proxy bootstrap for a freshly flashed board
+
+Usage: sudo $PROG [options]
+
+Options:
+  --proxy URL        HTTP proxy, e.g. http://192.168.3.114:6789
+                     (default: $DEFAULT_PROXY)
+  --data-root DIR    Where container layers live on overlayroot boards
+                     (default: $REAL_FS_HINT/docker-data)
+  --no-restart       Write the configuration but do not restart services
+  --force            Configure even if the proxy does not answer right now
+  -y, --yes          Do not ask for confirmation
+  -n, --dry-run      Print the plan, change nothing
+  -h, --help         Show this help
+
+Configures:
+  /etc/apt/apt.conf.d/99proxy.conf                         apt proxy
+  /etc/environment                                         shell proxy (new sessions)
+  /etc/systemd/system/containerd.service.d/http-proxy.conf containerd proxy (docker pull)
+  /etc/docker/daemon.json                                  daemon proxy (+ data-root)
+  /etc/containerd/config.toml                              container data off overlayfs
+
+Environment:
+  SETUP_DEVICE_PROXY_URL   same as --proxy
+EOF
+}
+
+need_root() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ "$(id -u)" -eq 0 ] || die "this command needs root: re-run with sudo"
+}
+
+# -------------------------------------------------------------------- options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --proxy)       [ $# -ge 2 ] || die "--proxy needs a value"; PROXY_URL="$2"; shift 2 ;;
+    --proxy=*)     PROXY_URL="${1#*=}"; shift ;;
+    --data-root)   [ $# -ge 2 ] || die "--data-root needs a value"; DATA_ROOT_OVERRIDE="$2"; shift 2 ;;
+    --data-root=*) DATA_ROOT_OVERRIDE="${1#*=}"; shift ;;
+    --no-restart)  NO_RESTART=1; shift ;;
+    --force)       FORCE=1; shift ;;
+    -y|--yes)      ASSUME_YES=1; shift ;;
+    -n|--dry-run)  DRY_RUN=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+# normalise the proxy URL: add a scheme if missing, strip trailing slashes
+case "$PROXY_URL" in
+  http://*|https://*|socks5://*|socks5h://*) ;;
+  *) PROXY_URL="http://${PROXY_URL}" ;;
+esac
+PROXY_URL="${PROXY_URL%/}"
+
+need_root
+
+# --------------------------------------------------------------- help helpers
+backup_file() {
+  local file="$1"
+  [ -e "$file" ] || return 0
+  if [ -z "$BACKUP_DIR" ]; then
+    BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
+  fi
+  mkdir -p "${BACKUP_DIR}$(dirname "$file")"
+  cp -a "$file" "${BACKUP_DIR}${file}"
+  info "backed up $file -> ${BACKUP_DIR}${file}"
+}
+
+# write_file <path> [mode]  (reads the content from stdin)
+write_file() {
+  local path="$1" mode="${2:-0644}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would write %s (mode %s):\n' "$path" "$mode"
+    sed 's/^/    /'
+    return 0
+  fi
+  mkdir -p "$(dirname "$path")"
+  cat > "$path"
+  chmod "$mode" "$path"
+  ok "wrote $path"
+}
+
+is_overlayroot() {
+  local fstype source
+  fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+  source="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  [ "$fstype" = "overlay" ] || printf '%s' "$source" | grep -qi overlayroot
+}
+
+# Prints the directory that should hold container data on this board, or
+# nothing when / is a normal filesystem.
+detect_data_root() {
+  if [ -n "$DATA_ROOT_OVERRIDE" ]; then
+    printf '%s' "$DATA_ROOT_OVERRIDE"
+    return 0
+  fi
+  if ! is_overlayroot; then
+    return 0
+  fi
+  if findmnt -n -o TARGET "$REAL_FS_HINT" >/dev/null 2>&1; then
+    printf '%s' "${REAL_FS_HINT}/docker-data"
+    return 0
+  fi
+  return 1
+}
+
+check_proxy() {
+  have curl || { warn "curl not found, skipping the proxy reachability check"; return 0; }
+  local code
+  code="$(curl -x "$PROXY_URL" -m 6 -s -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 || true)"
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    if [ "$FORCE" -eq 1 ]; then
+      warn "proxy $PROXY_URL does not answer right now; continuing because of --force"
+    else
+      die "proxy $PROXY_URL does not answer (HTTP ${code:-none}).
+       Check the proxy host, allow-lan and the firewall, or pass --force to configure anyway."
+    fi
+  else
+    ok "proxy $PROXY_URL answers (HTTP $code)"
+  fi
+}
+
+# ---------------------------------------------------------------------- steps
+step_apt() {
+  info "apt proxy -> $APT_CONF"
+  backup_file "$APT_CONF"
+  write_file "$APT_CONF" <<EOF
+Acquire::http::Proxy "$PROXY_URL";
+Acquire::https::Proxy "$PROXY_URL";
+EOF
+}
+
+step_environment() {
+  info "shell proxy -> $ENV_FILE (applies to new SSH/terminal sessions)"
+  if [ "$DRY_RUN" -eq 0 ] && grep -q '^http_proxy=' "$ENV_FILE" 2>/dev/null \
+     && ! grep -qF "$ENV_MARK_BEGIN" "$ENV_FILE"; then
+    warn "$ENV_FILE already defines http_proxy without our markers; leaving it untouched"
+    return 0
+  fi
+  backup_file "$ENV_FILE"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would set in %s:\n' "$ENV_FILE"
+    printf '    http_proxy=%s\n    https_proxy=%s\n    HTTP_PROXY=...\n    HTTPS_PROXY=...\n    no_proxy=%s\n    NO_PROXY=...\n' \
+      "$PROXY_URL" "$PROXY_URL" "$NO_PROXY_LIST"
+    return 0
+  fi
+  # drop a previous managed block, then append a fresh one
+  if grep -qF "$ENV_MARK_BEGIN" "$ENV_FILE" 2>/dev/null; then
+    awk -v b="$ENV_MARK_BEGIN" -v e="$ENV_MARK_END" '
+      $0 == b { skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip   { print }
+    ' "$ENV_FILE" > "${ENV_FILE}.setup-device-proxy.tmp"
+    mv "${ENV_FILE}.setup-device-proxy.tmp" "$ENV_FILE"
+  fi
+  {
+    printf '%s\n' "$ENV_MARK_BEGIN"
+    printf 'http_proxy=%s\n'   "$PROXY_URL"
+    printf 'https_proxy=%s\n'  "$PROXY_URL"
+    printf 'HTTP_PROXY=%s\n'   "$PROXY_URL"
+    printf 'HTTPS_PROXY=%s\n'  "$PROXY_URL"
+    printf 'no_proxy=%s\n'     "$NO_PROXY_LIST"
+    printf 'NO_PROXY=%s\n'     "$NO_PROXY_LIST"
+    printf '%s\n' "$ENV_MARK_END"
+  } >> "$ENV_FILE"
+  ok "updated $ENV_FILE"
+}
+
+step_containerd_proxy() {
+  info "containerd proxy -> $CONTAINERD_DROPIN (this is what actually pulls images)"
+  backup_file "$CONTAINERD_DROPIN"
+  write_file "$CONTAINERD_DROPIN" <<EOF
+[Service]
+Environment="HTTP_PROXY=$PROXY_URL"
+Environment="HTTPS_PROXY=$PROXY_URL"
+Environment="NO_PROXY=$NO_PROXY_LIST"
+Environment="http_proxy=$PROXY_URL"
+Environment="https_proxy=$PROXY_URL"
+Environment="no_proxy=$NO_PROXY_LIST"
+EOF
+}
+
+merge_daemon_json_python() {
+  local data_root="$1"
+  python3 - "$DAEMON_JSON" "$PROXY_URL" "$NO_PROXY_LIST" "$data_root" <<'PY'
+import json
+import os
+import sys
+
+path, proxy, no_proxy, data_root = sys.argv[1:5]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:                 # noqa: BLE001 - report and stop
+        sys.stderr.write("cannot parse %s: %s\n" % (path, exc))
+        sys.exit(2)
+    if not isinstance(data, dict):
+        sys.stderr.write("%s does not contain a JSON object\n" % path)
+        sys.exit(2)
+
+data["proxies"] = {
+    "http-proxy": proxy,
+    "https-proxy": proxy,
+    "no-proxy": no_proxy,
+}
+if data_root:
+    data["data-root"] = data_root
+
+print(json.dumps(data, indent=2))
+PY
+}
+
+merge_daemon_json() {
+  local data_root="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if have python3; then
+    if ! merge_daemon_json_python "$data_root" > "$tmp"; then
+      rm -f "$tmp"
+      die "could not merge $DAEMON_JSON (fix or remove it and re-run)"
+    fi
+  else
+    if [ -s "$DAEMON_JSON" ]; then
+      rm -f "$tmp"
+      warn "python3 not found and $DAEMON_JSON already exists; not touching it"
+      warn "add the proxies manually: \"proxies\": {\"http-proxy\": \"$PROXY_URL\", \"https-proxy\": \"$PROXY_URL\"}"
+      return 0
+    fi
+    if [ -n "$data_root" ]; then
+      printf '{\n  "data-root": "%s",\n  "proxies": {\n    "http-proxy": "%s",\n    "https-proxy": "%s",\n    "no-proxy": "%s"\n  }\n}\n' \
+        "$data_root" "$PROXY_URL" "$PROXY_URL" "$NO_PROXY_LIST" > "$tmp"
+    else
+      printf '{\n  "proxies": {\n    "http-proxy": "%s",\n    "https-proxy": "%s",\n    "no-proxy": "%s"\n  }\n}\n' \
+        "$PROXY_URL" "$PROXY_URL" "$NO_PROXY_LIST" > "$tmp"
+    fi
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "would write $DAEMON_JSON:"
+    sed 's/^/    /' "$tmp"
+  else
+    backup_file "$DAEMON_JSON"
+    mkdir -p "$(dirname "$DAEMON_JSON")"
+    install -m 0644 "$tmp" "$DAEMON_JSON"
+    ok "wrote $DAEMON_JSON"
+  fi
+  rm -f "$tmp"
+}
+
+step_docker() {
+  local data_root=""
+  if ! data_root="$(detect_data_root)"; then
+    warn "/ is overlayroot but $REAL_FS_HINT is not a mount; skipping the storage relocation"
+    warn "image extraction will probably fail with \"failed to convert whiteout file ...\""
+    data_root=""
+  fi
+
+  info "docker daemon proxy -> $DAEMON_JSON"
+  merge_daemon_json "$data_root"
+
+  if [ -n "$data_root" ]; then
+    info "container data root -> $data_root (keeping layers off overlayfs)"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      mkdir -p "${data_root}/docker" "${data_root}/containerd"
+      ok "created ${data_root}/{docker,containerd}"
+    else
+      printf '  [dry-run] would create %s/{docker,containerd}\n' "$data_root"
+    fi
+    step_containerd_root "${data_root}/containerd"
+  fi
+}
+
+step_containerd_root() {
+  local root_dir="$1"
+  [ -n "$root_dir" ] || return 0
+  if [ ! -f "$CONTAINERD_CONFIG" ]; then
+    warn "$CONTAINERD_CONFIG not found (containerd not installed yet?)"
+    warn "after installing Docker add this line to it: root = \"$root_dir\""
+    return 0
+  fi
+  if grep -qE '^[[:space:]]*root[[:space:]]*=' "$CONTAINERD_CONFIG"; then
+    ok "containerd root already configured"
+    return 0
+  fi
+  backup_file "$CONTAINERD_CONFIG"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would append to %s: root = "%s"\n' "$CONTAINERD_CONFIG" "$root_dir"
+    return 0
+  fi
+  printf '\n# added by setup-device-proxy: keep container layers off overlayfs\nroot = "%s"\n' \
+    "$root_dir" >> "$CONTAINERD_CONFIG"
+  ok "appended root to $CONTAINERD_CONFIG"
+}
+
+step_restart() {
+  if [ "$NO_RESTART" -eq 1 ]; then
+    info "--no-restart: skipping service restarts"
+    return 0
+  fi
+  if [ ! -d /run/systemd/system ]; then
+    warn "systemd is not running; restart containerd/docker yourself"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would run: systemctl daemon-reload\n'
+    return 0
+  fi
+  systemctl daemon-reload
+  if systemctl list-unit-files 2>/dev/null | grep -q '^containerd\.service'; then
+    if systemctl is-active --quiet containerd; then
+      info "restarting containerd (running containers keep running via their shims)"
+      systemctl restart containerd || warn "containerd restart failed — check: journalctl -u containerd"
+    fi
+  else
+    info "containerd is not installed yet — the proxy drop-in will apply on first start"
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
+    if systemctl is-active --quiet docker; then
+      info "restarting docker (containers with restart policies come back automatically)"
+      systemctl restart docker || warn "docker restart failed — check: journalctl -u docker"
+    fi
+  else
+    info "docker is not installed yet — daemon.json will apply on first start"
+  fi
+}
+
+# --------------------------------------------------------------------- verify
+verify() {
+  info "verification"
+
+  if have apt-config && apt-config dump 2>/dev/null | grep -qi 'Acquire.*Proxy'; then
+    ok "apt sees the proxy:"
+    apt-config dump 2>/dev/null | grep -i 'Acquire.*Proxy' | sed 's/^/    /'
+  else
+    warn "apt does not report a proxy"
+  fi
+
+  if have curl && [ "$DRY_RUN" -eq 0 ]; then
+    local code
+    code="$(curl -x "$PROXY_URL" -m 8 -s -o /dev/null -w '%{http_code}' https://ghcr.io/v2/ || true)"
+    case "$code" in
+      2*|3*|4*) ok "proxy route reaches ghcr.io (HTTP $code)" ;;
+      *)        warn "proxy route test returned HTTP ${code:-none} — check the proxy side" ;;
+    esac
+  fi
+
+  if have docker && [ "$DRY_RUN" -eq 0 ]; then
+    if docker info >/dev/null 2>&1; then
+      ok "docker daemon:"
+      docker info 2>/dev/null | grep -iE 'http proxy|https proxy|docker root dir' | sed 's/^/    /' || true
+    else
+      warn "docker info failed (daemon not running yet?)"
+    fi
+  fi
+}
+
+# ----------------------------------------------------------------------- main
+log ""
+log "${c_dim}$PROG $VERSION${c_reset}  proxy: $PROXY_URL"
+log ""
+
+check_proxy
+step_apt
+step_environment
+step_containerd_proxy
+step_docker
+step_restart
+verify
+
+log ""
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "Dry run complete — nothing was changed."
+  exit 0
+fi
+
+log "Done. New SSH/terminal sessions pick up the proxy automatically."
+log "For the current shell, run:"
+log "  export http_proxy=$PROXY_URL https_proxy=$PROXY_URL"
+log ""
+if [ -n "$BACKUP_DIR" ]; then
+  log "Previous files are backed up under: $BACKUP_DIR"
+fi
+log "Notes:"
+log "  * apt and the shell use the proxy; ghcr.nju.edu.cn is always contacted directly."
+log "  * If you later run docker-accel's proxy route as well, it only covers"
+log "    dockerd — the containerd drop-in written here is what makes pulls work."
