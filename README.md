@@ -142,7 +142,7 @@ sudo setup-device-proxy --proxy http://192.168.3.114:6789
 | 2 | shell / wget / git (new sessions) | `/etc/environment` (managed block) |
 | 3 | containerd — the process that actually pulls images | `/etc/systemd/system/containerd.service.d/http-proxy.conf` |
 | 4 | Docker daemon | `/etc/docker/daemon.json` (proxies merged, other keys kept) |
-| 5 | overlayroot boards only | containerd `root` and Docker `data-root` moved to `/media/root-rw/docker-data` |
+| 5 | overlayroot boards only | containerd `root` and Docker `data-root` moved to `/media/root-rw/docker-data` (`containerd/`, `docker/`) |
 
 Flags: `--proxy URL`, `--data-root DIR`, `--no-restart`, `--force`,
 `--dry-run`. Every touched file is backed up under

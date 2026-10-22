@@ -132,6 +132,10 @@ backup_file() {
   if [ -z "$BACKUP_DIR" ]; then
     BACKUP_DIR="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
   fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would back up %s -> %s%s\n' "$file" "$BACKUP_DIR" "$file"
+    return 0
+  fi
   mkdir -p "${BACKUP_DIR}$(dirname "$file")"
   cp -a "$file" "${BACKUP_DIR}${file}"
   info "backed up $file -> ${BACKUP_DIR}${file}"
@@ -327,16 +331,21 @@ step_docker() {
     data_root=""
   fi
 
+  local docker_root=""
+  if [ -n "$data_root" ]; then
+    docker_root="${data_root}/docker"
+  fi
+
   info "docker daemon proxy -> $DAEMON_JSON"
-  merge_daemon_json "$data_root"
+  merge_daemon_json "$docker_root"
 
   if [ -n "$data_root" ]; then
     info "container data root -> $data_root (keeping layers off overlayfs)"
     if [ "$DRY_RUN" -eq 0 ]; then
-      mkdir -p "${data_root}/docker" "${data_root}/containerd"
-      ok "created ${data_root}/{docker,containerd}"
+      mkdir -p "$docker_root" "${data_root}/containerd"
+      ok "created ${docker_root} and ${data_root}/containerd"
     else
-      printf '  [dry-run] would create %s/{docker,containerd}\n' "$data_root"
+      printf '  [dry-run] would create %s and %s\n' "$docker_root" "${data_root}/containerd"
     fi
     step_containerd_root "${data_root}/containerd"
   fi
@@ -400,9 +409,13 @@ step_restart() {
 verify() {
   info "verification"
 
-  if have apt-config && apt-config dump 2>/dev/null | grep -qi 'Acquire.*Proxy'; then
+  local apt_dump=""
+  if have apt-config; then
+    apt_dump="$(apt-config dump 2>/dev/null | grep -iE 'Acquire::(http|https)::Proxy' || true)"
+  fi
+  if [ -n "$apt_dump" ]; then
     ok "apt sees the proxy:"
-    apt-config dump 2>/dev/null | grep -i 'Acquire.*Proxy' | sed 's/^/    /'
+    printf '%s\n' "$apt_dump" | sed 's/^/    /'
   else
     warn "apt does not report a proxy"
   fi
