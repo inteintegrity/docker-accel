@@ -51,6 +51,7 @@ NO_RESTART=0
 FORCE=0
 ASSUME_YES=0
 WITH_RUSTDESK=0
+NO_SSH=0
 RUSTDESK_VERSION="${SETUP_DEVICE_RUSTDESK_VERSION:-latest}"
 RUSTDESK_URL="${SETUP_DEVICE_RUSTDESK_URL:-}"
 BACKUP_DIR=""
@@ -87,6 +88,8 @@ Options:
                      downloaded through the proxy; needs a desktop session)
   --rustdesk-version V   RustDesk version to install (default: latest)
   --rustdesk-url URL     Download the .deb from this URL instead
+  --no-ssh           Leave the SSH service alone (by default it is installed
+                     if needed and enabled to start at boot)
   -y, --yes          Do not ask for confirmation
   -n, --dry-run      Print the plan, change nothing
   -h, --help         Show this help
@@ -97,6 +100,7 @@ Configures:
   /etc/systemd/system/containerd.service.d/http-proxy.conf containerd proxy (docker pull)
   /etc/docker/daemon.json                                  daemon proxy (+ data-root)
   /etc/containerd/config.toml                              container data off overlayfs
+  SSH (unless --no-ssh): installs openssh-server if missing, enables it at boot
 
 Environment:
   SETUP_DEVICE_PROXY_URL   same as --proxy
@@ -122,6 +126,7 @@ while [ $# -gt 0 ]; do
     --rustdesk-version=*) RUSTDESK_VERSION="${1#*=}"; shift ;;
     --rustdesk-url)       [ $# -ge 2 ] || die "--rustdesk-url needs a value"; RUSTDESK_URL="$2"; shift 2 ;;
     --rustdesk-url=*)     RUSTDESK_URL="${1#*=}"; shift ;;
+    --no-ssh)      NO_SSH=1; shift ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
     -n|--dry-run)  DRY_RUN=1; shift ;;
     -h|--help)     usage; exit 0 ;;
@@ -252,6 +257,84 @@ step_environment() {
     printf '%s\n' "$ENV_MARK_END"
   } >> "$ENV_FILE"
   ok "updated $ENV_FILE"
+}
+
+# ----------------------------------------------------------------------- ssh
+pick_ssh_unit() {
+  local unit
+  # keep whatever the image already uses (ssh.socket on modern Ubuntu,
+  # ssh.service on Debian/Armbian/Raspberry Pi OS)
+  for unit in ssh.socket ssh.service sshd.service; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null \
+       || systemctl is-active --quiet "$unit" 2>/dev/null; then
+      printf '%s' "$unit"
+      return 0
+    fi
+  done
+  for unit in ssh.service ssh.socket sshd.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      printf '%s' "$unit"
+      return 0
+    fi
+  done
+  return 1
+}
+
+step_ssh() {
+  if [ "$NO_SSH" -eq 1 ]; then
+    info "--no-ssh: leaving the SSH service alone"
+    return 0
+  fi
+  info "ssh service (enabled + started, so you can reconnect after a reboot)"
+  if ! have systemctl || [ ! -d /run/systemd/system ]; then
+    warn "systemd is not running; skipping the SSH step"
+    return 0
+  fi
+
+  local unit=""
+  if unit="$(pick_ssh_unit)"; then
+    :
+  else
+    unit=""
+  fi
+
+  if [ -z "$unit" ]; then
+    info "openssh-server is not installed; installing it (through the proxy)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '  [dry-run] would run: apt-get install -y openssh-server\n'
+      return 0
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server; then
+      warn "could not install openssh-server; SSH stays unavailable"
+      return 0
+    fi
+    unit="$(pick_ssh_unit || true)"
+    if [ -z "$unit" ]; then
+      warn "openssh-server installed but no systemd unit was found"
+      return 0
+    fi
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run] would run: systemctl enable --now %s\n' "$unit"
+    return 0
+  fi
+
+  if systemctl enable --now "$unit" >/dev/null 2>&1; then
+    ok "ssh enabled at boot and running ($unit)"
+  else
+    warn "could not enable/start $unit — check: systemctl status $unit"
+  fi
+
+  if have ss; then
+    local listening
+    listening="$(ss -ltn 2>/dev/null | grep -c ':22 ' || true)"
+    if [ "${listening:-0}" -gt 0 ]; then
+      ok "port 22 is listening"
+    else
+      warn "port 22 is not listening yet — check: systemctl status $unit"
+    fi
+  fi
 }
 
 step_containerd_proxy() {
@@ -537,6 +620,7 @@ log ""
 check_proxy
 step_apt
 step_environment
+step_ssh
 step_containerd_proxy
 step_docker
 step_restart

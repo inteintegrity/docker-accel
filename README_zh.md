@@ -132,8 +132,9 @@ sudo setup-device-proxy --proxy http://192.168.3.114:6789
 | 3 | containerd（真正拉镜像的进程） | `/etc/systemd/system/containerd.service.d/http-proxy.conf` |
 | 4 | Docker 守护进程 | `/etc/docker/daemon.json`（合并 proxies，保留其他键） |
 | 5 | 仅 overlayroot 板子 | containerd `root` 与 Docker `data-root` 挪到 `/media/root-rw/docker-data`（`containerd/`、`docker/`） |
+| 6 | SSH（可用 `--no-ssh` 跳过） | 缺 `openssh-server` 时自动安装，并设为开机自启 |
 
-参数：`--proxy URL`、`--data-root DIR`、`--no-restart`、`--force`、`--dry-run`，
+参数：`--proxy URL`、`--data-root DIR`、`--no-restart`、`--force`、`--dry-run`、`--no-ssh`，
 以及 `--with-rustdesk`（经代理下载并安装当前架构的 RustDesk `.deb`；
 `--rustdesk-version` / `--rustdesk-url` 可指定版本或下载地址）。
 所有被修改的文件都备份到 `/var/backups/setup-device-proxy/<时间戳>/`。

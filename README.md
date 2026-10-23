@@ -143,9 +143,10 @@ sudo setup-device-proxy --proxy http://192.168.3.114:6789
 | 3 | containerd — the process that actually pulls images | `/etc/systemd/system/containerd.service.d/http-proxy.conf` |
 | 4 | Docker daemon | `/etc/docker/daemon.json` (proxies merged, other keys kept) |
 | 5 | overlayroot boards only | containerd `root` and Docker `data-root` moved to `/media/root-rw/docker-data` (`containerd/`, `docker/`) |
+| 6 | SSH (unless `--no-ssh`) | installs `openssh-server` if missing and enables it at boot |
 
 Flags: `--proxy URL`, `--data-root DIR`, `--no-restart`, `--force`,
-`--dry-run`, and `--with-rustdesk` (installs the RustDesk `.deb` for the
+`--dry-run`, `--no-ssh`, and `--with-rustdesk` (installs the RustDesk `.deb` for the
 current architecture through the proxy; `--rustdesk-version` / `--rustdesk-url`
 override what gets downloaded). Every touched file is backed up under
 `/var/backups/setup-device-proxy/<timestamp>/`. New SSH/terminal sessions pick
